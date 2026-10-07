@@ -32,9 +32,12 @@
 #include <grp.h>
 
 #if __linux__
+#include <linux/capability.h>
 #include <linux/reboot.h>
 #include <linux/vm_sockets.h>
+#include <sys/prctl.h>
 #include <sys/reboot.h>
+#include <sys/syscall.h>
 #endif
 
 #include "dhcp.h"
@@ -54,6 +57,7 @@
 #define MAX_TOKENS 16384
 
 static int jsoneq(const char *, jsmntok_t *, const char *);
+void set_exit_code(int code);
 
 #ifdef SEV
 static char *sev_get_luks_passphrase(int *);
@@ -892,14 +896,205 @@ char **concat_entrypoint_argv(char **entrypoint, char **config_argv)
     return argv;
 }
 
+#if __linux__
+struct guest_security {
+    bool no_new_privileges;
+    bool has_capabilities;
+    uint64_t effective, permitted, inheritable, bounding, ambient;
+    unsigned int last_cap;
+};
+
+static struct guest_security guest_security;
+
+static void security_error(const char *operation, int error)
+{
+    fprintf(stderr, "%s: %s\n", operation, strerror(error));
+    /* Before fork, PID 1 must report the error itself. */
+    if (getpid() == 1)
+        set_exit_code(125);
+    exit(125);
+}
+
+/* Find a typed member, skipping nested values and optional null fields. */
+static int config_find(const char *data, jsmntok_t *tokens, int count,
+                       int object, const char *name, jsmntype_t type)
+{
+    int i, value, end;
+
+    if (object < 0 || tokens[object].type != JSMN_OBJECT)
+        return -1;
+    for (i = object + 1;
+         i + 1 < count && tokens[i].start < tokens[object].end;) {
+        value = i + 1;
+        if (jsoneq(data, &tokens[i], name) == 0) {
+            return tokens[value].type == type ? value : -1;
+        }
+        end = tokens[value].end;
+        for (i = value + 1; i < count && tokens[i].start < end; ++i)
+            ;
+    }
+    return -1;
+}
+
+#define CAP_ENTRY(name) {#name, name}
+static const struct {
+    const char *name;
+    unsigned int number;
+} guest_cap_names[] = {
+    CAP_ENTRY(CAP_CHOWN), CAP_ENTRY(CAP_DAC_OVERRIDE),
+    CAP_ENTRY(CAP_DAC_READ_SEARCH), CAP_ENTRY(CAP_FOWNER),
+    CAP_ENTRY(CAP_FSETID), CAP_ENTRY(CAP_KILL), CAP_ENTRY(CAP_SETGID),
+    CAP_ENTRY(CAP_SETUID), CAP_ENTRY(CAP_SETPCAP),
+    CAP_ENTRY(CAP_LINUX_IMMUTABLE), CAP_ENTRY(CAP_NET_BIND_SERVICE),
+    CAP_ENTRY(CAP_NET_BROADCAST), CAP_ENTRY(CAP_NET_ADMIN),
+    CAP_ENTRY(CAP_NET_RAW), CAP_ENTRY(CAP_IPC_LOCK), CAP_ENTRY(CAP_IPC_OWNER),
+    CAP_ENTRY(CAP_SYS_MODULE), CAP_ENTRY(CAP_SYS_RAWIO), CAP_ENTRY(CAP_SYS_CHROOT),
+    CAP_ENTRY(CAP_SYS_PTRACE), CAP_ENTRY(CAP_SYS_PACCT), CAP_ENTRY(CAP_SYS_ADMIN),
+    CAP_ENTRY(CAP_SYS_BOOT), CAP_ENTRY(CAP_SYS_NICE), CAP_ENTRY(CAP_SYS_RESOURCE),
+    CAP_ENTRY(CAP_SYS_TIME), CAP_ENTRY(CAP_SYS_TTY_CONFIG), CAP_ENTRY(CAP_MKNOD),
+    CAP_ENTRY(CAP_LEASE), CAP_ENTRY(CAP_AUDIT_WRITE), CAP_ENTRY(CAP_AUDIT_CONTROL),
+    CAP_ENTRY(CAP_SETFCAP), CAP_ENTRY(CAP_MAC_OVERRIDE), CAP_ENTRY(CAP_MAC_ADMIN),
+    CAP_ENTRY(CAP_SYSLOG), CAP_ENTRY(CAP_WAKE_ALARM), CAP_ENTRY(CAP_BLOCK_SUSPEND),
+    CAP_ENTRY(CAP_AUDIT_READ), CAP_ENTRY(CAP_PERFMON), CAP_ENTRY(CAP_BPF),
+    CAP_ENTRY(CAP_CHECKPOINT_RESTORE),
+};
+#undef CAP_ENTRY
+
+static uint64_t config_parse_cap_set(char *data, jsmntok_t *tokens, int count,
+                                    int object, const char *name)
+{
+    uint64_t mask = 0;
+    int array, i;
+    size_t j;
+    char *value;
+
+    array = config_find(data, tokens, count, object, name, JSMN_ARRAY);
+    if (array < 0)
+        return 0;
+    for (i = array + 1;
+         i < count && tokens[i].start < tokens[array].end; ++i) {
+        if (tokens[i].type != JSMN_STRING)
+            security_error(name, EINVAL);
+        value = data + tokens[i].start;
+        unescape_string(value, tokens[i].end - tokens[i].start);
+        for (j = 0; j < sizeof(guest_cap_names) / sizeof(guest_cap_names[0]); ++j) {
+            if (strcasecmp(value, guest_cap_names[j].name) == 0) {
+                mask |= UINT64_C(1) << guest_cap_names[j].number;
+                break;
+            }
+        }
+        if (j == sizeof(guest_cap_names) / sizeof(guest_cap_names[0]))
+            fprintf(stderr, "Unknown capability: %s\n", value);
+    }
+    return mask;
+}
+
+static void config_parse_security(char *data, jsmntok_t *tokens, int count,
+                                 struct guest_security *security)
+{
+    int process, nnp, caps;
+
+    process = config_find(data, tokens, count, 0, "process", JSMN_OBJECT);
+    if (process < 0)
+        return;
+    nnp = config_find(data, tokens, count, process, "noNewPrivileges", JSMN_PRIMITIVE);
+    if (nnp >= 0)
+        security->no_new_privileges = tokens[nnp].end - tokens[nnp].start == 4 &&
+                                     memcmp(data + tokens[nnp].start, "true", 4) == 0;
+    caps = config_find(data, tokens, count, process, "capabilities", JSMN_OBJECT);
+    if (caps < 0)
+        return;
+    security->has_capabilities = true;
+    security->effective = config_parse_cap_set(data, tokens, count, caps, "effective");
+    security->permitted = config_parse_cap_set(data, tokens, count, caps, "permitted");
+    security->inheritable = config_parse_cap_set(data, tokens, count, caps, "inheritable");
+    security->bounding = config_parse_cap_set(data, tokens, count, caps, "bounding");
+    security->ambient = config_parse_cap_set(data, tokens, count, caps, "ambient");
+}
+
+static void load_guest_cap_limit(struct guest_security *security)
+{
+    char buffer[32];
+    unsigned long last_cap;
+    ssize_t length;
+    int fd;
+
+    fd = open("/proc/sys/kernel/cap_last_cap", O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        security_error("open cap_last_cap", errno);
+    length = read(fd, buffer, sizeof(buffer) - 1);
+    if (length <= 0)
+        security_error("read cap_last_cap", length < 0 ? errno : EINVAL);
+    close(fd);
+    buffer[length] = '\0';
+    errno = 0;
+    last_cap = strtoul(buffer, NULL, 10);
+    if (errno || last_cap >= 64)
+        security_error("parse cap_last_cap", errno ? errno : EINVAL);
+    security->last_cap = last_cap;
+}
+
+static void prepare_guest_caps(struct guest_security *security)
+{
+    unsigned int cap;
+
+    if (!security->has_capabilities)
+        return;
+    load_guest_cap_limit(security);
+    for (cap = 0; cap <= security->last_cap; ++cap) {
+        if (!(security->bounding & (UINT64_C(1) << cap)) &&
+            prctl(PR_CAPBSET_DROP, (unsigned long)cap, 0UL, 0UL, 0UL) < 0)
+            security_error("drop capability bounding set", errno);
+    }
+    if (prctl(PR_SET_KEEPCAPS, 1UL, 0UL, 0UL, 0UL) < 0)
+        security_error("retain capabilities across UID change", errno);
+}
+
+static void apply_guest_security(const struct guest_security *security)
+{
+    struct __user_cap_header_struct header = {_LINUX_CAPABILITY_VERSION_3, 0};
+    struct __user_cap_data_struct data[2] = {{0}};
+    unsigned int i, cap;
+
+    if (security->has_capabilities) {
+        for (i = 0; i < 2; ++i) {
+            data[i].effective = security->effective >> (32 * i);
+            data[i].permitted = security->permitted >> (32 * i);
+            data[i].inheritable = security->inheritable >> (32 * i);
+        }
+        if (syscall(SYS_capset, &header, data) < 0)
+            security_error("set capabilities", errno);
+        if (prctl(PR_CAP_AMBIENT, (unsigned long)PR_CAP_AMBIENT_CLEAR_ALL,
+                  0UL, 0UL, 0UL) < 0) {
+            if (errno != EINVAL && errno != EPERM)
+                security_error("clear ambient capabilities", errno);
+            perror("clear ambient capabilities");
+        }
+        for (cap = 0; cap <= security->last_cap; ++cap)
+            if ((security->ambient & (UINT64_C(1) << cap)) &&
+                prctl(PR_CAP_AMBIENT, (unsigned long)PR_CAP_AMBIENT_RAISE,
+                      (unsigned long)cap, 0UL, 0UL) < 0) {
+                if (errno != EINVAL && errno != EPERM)
+                    security_error("raise ambient capability", errno);
+                fprintf(stderr, "Cannot raise ambient capability %u: %s\n",
+                        cap, strerror(errno));
+            }
+    }
+    if (security->no_new_privileges &&
+        prctl(PR_SET_NO_NEW_PRIVS, 1UL, 0UL, 0UL, 0UL) < 0)
+        security_error("set no-new-privileges", errno);
+}
+#endif
+
 static int config_parse_file(char ***argv, char **workdir, char **uid,
-                             char **gid, const char *config_file)
+                             char **gid, const char *config_file, bool optional)
 {
     jsmn_parser parser;
     jsmntok_t *tokens;
     struct stat stat;
     char *data;
     off_t data_len;
+    ssize_t bytes_read;
     char **config_argv;
     char **entrypoint;
     int parsed_env, parsed_workdir, parsed_args, parsed_entrypoint, parsed_uid,
@@ -911,6 +1106,9 @@ static int config_parse_file(char ***argv, char **workdir, char **uid,
 
     fd = open(config_file, O_RDONLY);
     if (fd < 0) {
+        if (optional && errno == ENOENT)
+            return 0;
+        perror("Couldn't open config file");
         return ret;
     }
 
@@ -926,7 +1124,10 @@ static int config_parse_file(char ***argv, char **workdir, char **uid,
         goto cleanup_fd;
     }
 
-    if (read(fd, data, data_len) < 0) {
+    bytes_read = read(fd, data, data_len);
+    if (bytes_read != data_len) {
+        if (bytes_read >= 0)
+            errno = EIO;
         perror("Error reading config file");
         goto cleanup_data;
     }
@@ -948,6 +1149,10 @@ static int config_parse_file(char ***argv, char **workdir, char **uid,
         printf("Couldn't find object in config file\n");
         goto cleanup_tokens;
     }
+
+#if __linux__
+    config_parse_security(data, tokens, num_tokens, &guest_security);
+#endif
 
     config_argv = NULL;
     entrypoint = NULL;
@@ -1354,6 +1559,7 @@ int main(int argc, char **argv)
     int status;
     int saved_errno;
     bool init_pid1 = false;
+    bool config_optional = false;
     char localhost[] = "localhost\0";
     char *hostname;
     char *krun_home;
@@ -1510,10 +1716,14 @@ int main(int argc, char **argv)
 
     if (!config_file) {
         config_file = CONFIG_FILE_PATH;
+        config_optional = true;
     }
 
-    config_parse_file(&config_argv, &config_workdir, &config_uid, &config_gid,
-                      config_file);
+    if (config_parse_file(&config_argv, &config_workdir, &config_uid, &config_gid,
+                          config_file, config_optional) < 0) {
+        set_exit_code(125);
+        exit(125);
+    }
 
 #if __FreeBSD__
     if (config_file_mounted) {
@@ -1593,6 +1803,9 @@ int main(int argc, char **argv)
             exit(125);
         }
 #endif
+#if __linux__
+        prepare_guest_caps(&guest_security);
+#endif
         // Set group first as otherwise we don't have permission to set user
         if (config_gid) {
             setgid_wrapper(config_gid);
@@ -1600,6 +1813,9 @@ int main(int argc, char **argv)
         if (config_uid) {
             setuid_wrapper(config_uid);
         }
+#if __linux__
+        apply_guest_security(&guest_security);
+#endif
 
         if (execvp(exec_argv[0], exec_argv) < 0) {
             saved_errno = errno;
