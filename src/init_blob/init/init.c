@@ -33,7 +33,9 @@
 
 #if __linux__
 #include <linux/capability.h>
+#include <linux/filter.h>
 #include <linux/reboot.h>
+#include <linux/seccomp.h>
 #include <linux/vm_sockets.h>
 #include <sys/prctl.h>
 #include <sys/reboot.h>
@@ -902,6 +904,8 @@ struct guest_security {
     bool has_capabilities;
     uint64_t effective, permitted, inheritable, bounding, ambient;
     unsigned int last_cap;
+    struct sock_fprog seccomp;
+    unsigned int seccomp_flags;
 };
 
 static struct guest_security guest_security;
@@ -934,6 +938,104 @@ static int config_find(const char *data, jsmntok_t *tokens, int count,
             ;
     }
     return -1;
+}
+
+static void config_parse_seccomp(char *data, jsmntok_t *tokens, int count,
+                                 struct guest_security *security)
+{
+    static const char alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    char *encoded, *flag;
+    unsigned char *filter;
+    size_t length, i, j, size = 0;
+    int annotations, bpf, linux_config, seccomp, flags, padding;
+    uint32_t word;
+    const char *digit;
+
+    annotations = config_find(data, tokens, count, 0, "annotations", JSMN_OBJECT);
+    bpf = config_find(data, tokens, count, annotations,
+                      "run.oci.seccomp_bpf_data", JSMN_STRING);
+    if (bpf < 0)
+        return;
+    encoded = config_parse_string(data, &tokens[bpf]);
+    if (!encoded)
+        security_error("read seccomp BPF", tokens[bpf].end == tokens[bpf].start ?
+                       EINVAL : ENOMEM);
+    length = strlen(encoded);
+    if (!length || length % 4 ||
+        length > 4 * ((BPF_MAXINSNS * sizeof(struct sock_filter) + 2) / 3))
+        security_error("decode seccomp BPF", EINVAL);
+
+    /* Decode in place; the allocation is also aligned for sock_filter. */
+    filter = (unsigned char *)encoded;
+    for (i = 0; i < length; i += 4) {
+        word = 0;
+        padding = 0;
+        for (j = 0; j < 4; ++j) {
+            word <<= 6;
+            if (encoded[i + j] == '=') {
+                if (i + 4 != length || j < 2)
+                    security_error("decode seccomp BPF", EINVAL);
+                ++padding;
+            } else {
+                digit = strchr(alphabet, encoded[i + j]);
+                if (!digit || padding)
+                    security_error("decode seccomp BPF", EINVAL);
+                word |= digit - alphabet;
+            }
+        }
+        filter[size++] = word >> 16;
+        if (padding < 2)
+            filter[size++] = word >> 8;
+        if (!padding)
+            filter[size++] = word;
+    }
+    if (!size || size % sizeof(struct sock_filter) ||
+        size > BPF_MAXINSNS * sizeof(struct sock_filter))
+        security_error("seccomp BPF size", EINVAL);
+    security->seccomp.len = size / sizeof(struct sock_filter);
+    security->seccomp.filter = (struct sock_filter *)filter;
+
+    linux_config = config_find(data, tokens, count, 0, "linux", JSMN_OBJECT);
+    seccomp = config_find(data, tokens, count, linux_config, "seccomp", JSMN_OBJECT);
+    flags = config_find(data, tokens, count, seccomp, "flags", JSMN_ARRAY);
+    security->seccomp_flags = flags < 0 ? SECCOMP_FILTER_FLAG_SPEC_ALLOW : 0;
+    if (flags < 0)
+        return;
+    for (i = flags + 1;
+         i < (size_t)count && tokens[i].start < tokens[flags].end; ++i) {
+        if (tokens[i].type != JSMN_STRING)
+            security_error("seccomp flag", EINVAL);
+        flag = config_parse_string(data, &tokens[i]);
+        if (!flag)
+            security_error("seccomp flag", EINVAL);
+        if (!strcmp(flag, "SECCOMP_FILTER_FLAG_TSYNC"))
+            security->seccomp_flags |= SECCOMP_FILTER_FLAG_TSYNC;
+        else if (!strcmp(flag, "SECCOMP_FILTER_FLAG_SPEC_ALLOW"))
+            security->seccomp_flags |= SECCOMP_FILTER_FLAG_SPEC_ALLOW;
+        else if (!strcmp(flag, "SECCOMP_FILTER_FLAG_LOG"))
+            security->seccomp_flags |= SECCOMP_FILTER_FLAG_LOG;
+        else if (!strcmp(flag, "SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV"))
+            security->seccomp_flags |= SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV;
+        else
+            security_error("unknown seccomp flag", EINVAL);
+        free(flag);
+    }
+}
+
+static void apply_guest_seccomp(const struct guest_security *security)
+{
+    int ret;
+
+    if (!security->seccomp.len)
+        return;
+    ret = syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER,
+                  security->seccomp_flags, &security->seccomp);
+    /* Match crun's fallback when the guest kernel rejects optional flags. */
+    if (ret < 0 && errno == EINVAL)
+        ret = syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &security->seccomp);
+    if (ret < 0)
+        security_error("seccomp (SECCOMP_SET_MODE_FILTER)", errno);
 }
 
 #define CAP_ENTRY(name) {#name, name}
@@ -1040,7 +1142,6 @@ static void prepare_guest_caps(struct guest_security *security)
 
     if (!security->has_capabilities)
         return;
-    load_guest_cap_limit(security);
     for (cap = 0; cap <= security->last_cap; ++cap) {
         if (!(security->bounding & (UINT64_C(1) << cap)) &&
             prctl(PR_CAPBSET_DROP, (unsigned long)cap, 0UL, 0UL, 0UL) < 0)
@@ -1152,6 +1253,7 @@ static int config_parse_file(char ***argv, char **workdir, char **uid,
 
 #if __linux__
     config_parse_security(data, tokens, num_tokens, &guest_security);
+    config_parse_seccomp(data, tokens, num_tokens, &guest_security);
 #endif
 
     config_argv = NULL;
@@ -1804,6 +1906,10 @@ int main(int argc, char **argv)
         }
 #endif
 #if __linux__
+        if (guest_security.has_capabilities)
+            load_guest_cap_limit(&guest_security);
+        if (!guest_security.no_new_privileges)
+            apply_guest_seccomp(&guest_security);
         prepare_guest_caps(&guest_security);
 #endif
         // Set group first as otherwise we don't have permission to set user
@@ -1815,6 +1921,8 @@ int main(int argc, char **argv)
         }
 #if __linux__
         apply_guest_security(&guest_security);
+        if (guest_security.no_new_privileges)
+            apply_guest_seccomp(&guest_security);
 #endif
 
         if (execvp(exec_argv[0], exec_argv) < 0) {

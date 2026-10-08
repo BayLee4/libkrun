@@ -91,6 +91,10 @@ The bundled Linux init applies OCI `process.noNewPrivileges` and
 `process.capabilities` from `/.krun_config.json` (or `KRUN_CONFIG`) before
 executing the workload. Setup and the normal supervisor remain privileged.
 
+It also installs base64-encoded seccomp BPF from the
+`run.oci.seccomp_bpf_data` annotation, using the flags in `linux.seccomp`.
+Seccomp notification listeners are not supported in the guest.
+
 While defining the security implementation of your environment, you should think about the guest and the VMM as a single entity. To prevent the guest from accessing host's resources, you need to use the host's OS security features to run the VMM inside an isolated context. On Linux, the primary mechanism to be used for this purpose is namespaces. Single-user systems may have a more relaxed security policy and just ensure the VMM runs with a particular UID/GID.
 
 While most virtio devices allow the guest to access resources from the host, two of them require special consideration when used: virtio-fs and virtio-vsock+TSI.

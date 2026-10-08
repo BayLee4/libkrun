@@ -4,6 +4,9 @@ use test_vm_config::TestVmConfig;
 mod test_guest_capabilities;
 use test_guest_capabilities::TestGuestCapabilities;
 
+mod test_guest_seccomp;
+use test_guest_seccomp::TestGuestSeccomp;
+
 mod test_vsock_guest_connect;
 use test_vsock_guest_connect::TestVsockGuestConnect;
 
@@ -90,6 +93,14 @@ pub fn test_cases() -> Vec<TestCase> {
         TestCase::new(
             "guest-ungrantable-ambient-capability",
             Box::new(TestGuestCapabilities { inheritable: false }),
+        ),
+        TestCase::new(
+            "guest-seccomp",
+            Box::new(TestGuestSeccomp { no_new_privileges: false }),
+        ),
+        TestCase::new(
+            "guest-seccomp-no-new-privileges",
+            Box::new(TestGuestSeccomp { no_new_privileges: true }),
         ),
         TestCase::new("vsock-guest-connect", Box::new(TestVsockGuestConnect)),
         #[cfg(any(feature = "host", target_os = "linux"))]
